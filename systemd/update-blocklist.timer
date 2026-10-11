@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[Unit]
+Description=Re-assemble IP blocklists, drops sources that stopped updating
+
+[Timer]
+# downloads trigger the assembly themselves (OnSuccess=); this run only makes
+# sure lists that are no longer updated age out
+OnCalendar=*-*-* 03/6:50:00
+AccuracySec=10min
+
+[Install]
+WantedBy=timers.target

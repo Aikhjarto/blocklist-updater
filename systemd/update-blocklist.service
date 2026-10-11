@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[Unit]
+Description=Assemble IP blocklists and publish them on the Nextcloud share
+Documentation=file:/etc/blocklists/blocklists.conf
+
+[Service]
+Type=oneshot
+User=wwwrun
+Group=www
+ExecStart=/usr/local/sbin/blocklist assemble
+SyslogIdentifier=blocklist-assemble
+TimeoutStartSec=10min
+UMask=0022
+
+ProtectSystem=strict
+# the directory of "output" in blocklists.conf must be added with a drop-in,
+# see examples/nextcloud.conf
+ReadWritePaths=/var/spool/blocklists
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native

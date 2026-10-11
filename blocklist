@@ -1,0 +1,307 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Thomas Wagner
+"""Download IP blocklists and assemble them into one list for fail2ban/block-badips.
+
+  blocklist fetch <source>     download one source into the spool directory
+  blocklist assemble [--force] merge fresh sources and publish the list
+
+Configuration: /etc/blocklists/blocklists.conf, or the file named by the
+environment variable BLOCKLIST_CONFIG.
+"""
+
+import configparser
+import fcntl
+import ipaddress
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+CONFIG_FILE = os.environ.get("BLOCKLIST_CONFIG", "/etc/blocklists/blocklists.conf")
+USER_AGENT = "blocklist-updater/1.0"
+MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
+# networks that must never end up in a blocklist (RFC 6890 and friends)
+SPECIAL_NETS = [ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16",
+    "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+    "::/128", "::1/128", "::ffff:0:0/96", "64:ff9b::/96", "100::/64", "2001:db8::/32",
+    "fc00::/7", "fe80::/10", "ff00::/8",
+)]
+GLOBAL_UNICAST_V6 = ipaddress.ip_network("2000::/3")
+
+
+# journald reads the priority from a "<N>" prefix; omit it on a terminal
+def log(prio, msg):
+    prefix = "" if sys.stderr.isatty() else f"<{prio}>"
+    print(f"{prefix}{msg}", file=sys.stderr, flush=True)
+
+def info(msg): log(6, msg)
+def warn(msg): log(4, msg)
+def error(msg): log(3, msg)
+
+
+class Config:
+    def __init__(self, path=CONFIG_FILE):
+        self.cp = configparser.ConfigParser(interpolation=None)
+        if not self.cp.read(path):
+            raise SystemExit(f"cannot read {path}")
+        g = self.cp["global"]
+        self.spool_dir = g["spool_dir"]
+        self.output = g["output"]
+        self.post_publish = g.get("post_publish", "").strip()
+        self.never_block = [ipaddress.ip_network(n, strict=False) for n in g.get("never_block", "").split()]
+        self.min_prefix = {4: g.getint("min_prefix_v4", 8), 6: g.getint("min_prefix_v6", 19)}
+        self.max_shrink = g.getint("max_shrink_percent", 30)
+        self.default_max_age = g.getfloat("default_max_age_days", 3)
+        self.default_min_entries = g.getint("default_min_entries", 10)
+
+    def sources(self):
+        return [s for s in self.cp.sections() if s != "global"]
+
+    def source(self, name):
+        if name == "global" or not self.cp.has_section(name):
+            raise SystemExit(f"unknown source '{name}', see {CONFIG_FILE}")
+        return self.cp[name]
+
+    def spool_file(self, name):
+        return os.path.join(self.spool_dir, f"{name}.txt")
+
+
+def parse_network(token):
+    """Return an ip_network for an IP or CIDR string, or None if invalid."""
+    try:
+        return ipaddress.ip_network(token, strict=False)
+    except ValueError:
+        return None
+
+
+def fmt(net):
+    """Hosts without /32 or /128, the format block-badips.sh expects."""
+    return str(net.network_address) if net.prefixlen == net.max_prefixlen else str(net)
+
+
+# --- parsers: yield candidate tokens from the downloaded text ---------------
+
+def parse_plain(text):
+    for line in text.splitlines():
+        line = line.lstrip("﻿").split("#", 1)[0].split(";", 1)[0].strip()
+        if line:
+            yield line.split()[0]
+
+def parse_spamhaus_json(text):
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            yield line.strip()  # counted as invalid
+            continue
+        if obj.get("type") != "metadata":
+            yield obj.get("cidr", "")
+
+def parse_dshield(text):
+    for line in text.splitlines():
+        cols = line.split("\t")
+        if line.startswith("#") or not line.strip() or cols[0] == "Start":
+            continue
+        yield f"{cols[0]}/{cols[2]}" if len(cols) >= 3 else line.strip()
+
+PARSERS = {"plain": parse_plain, "spamhaus-json": parse_spamhaus_json, "dshield": parse_dshield}
+
+
+def download(src):
+    req = urllib.request.Request(src["url"], headers={"User-Agent": USER_AGENT})
+    for header in src.get("headers", "").splitlines():
+        if header.strip():
+            k, v = header.split(":", 1)
+            req.add_header(k.strip(), v.strip())
+    cred = src.get("key_credential")
+    if cred:
+        cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+        if not cred_dir:
+            raise RuntimeError(f"credential '{cred}' not available; run via update-blocklist@<source>.service")
+        with open(os.path.join(cred_dir, cred)) as f:
+            req.add_header("Key", f.read().strip())
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = resp.read(MAX_DOWNLOAD_BYTES + 1)
+    if len(data) > MAX_DOWNLOAD_BYTES:
+        raise RuntimeError(f"download larger than {MAX_DOWNLOAD_BYTES} bytes")
+    return data.decode("utf-8", errors="replace")
+
+
+def atomic_write(path, lines, mode=0o644):
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=d)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.writelines(line + "\n" for line in lines)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def cmd_fetch(cfg, name):
+    src = cfg.source(name)
+    parser = PARSERS.get(src.get("format", "plain"))
+    if parser is None:
+        raise SystemExit(f"{name}: unknown format '{src.get('format')}'")
+    try:
+        text = download(src)
+    except Exception as e:
+        error(f"{name}: download of {src['url']} failed: {e}; keeping previous list")
+        return 1
+
+    valid, invalid = [], []
+    for token in parser(text):
+        net = parse_network(token)
+        (valid if net else invalid).append(net or token)
+    min_entries = src.getint("min_entries", cfg.default_min_entries)
+    if len(valid) < min_entries:
+        error(f"{name}: only {len(valid)} valid entries (expected at least {min_entries}), "
+              f"response starts with {text[:200]!r}; keeping previous list")
+        return 1
+    if len(invalid) > max(5, len(valid) // 20):
+        error(f"{name}: {len(invalid)} invalid entries (e.g. {invalid[:3]}); keeping previous list")
+        return 1
+    if invalid:
+        warn(f"{name}: ignored {len(invalid)} invalid entries: {invalid[:5]}")
+
+    lines = sorted({fmt(n) for n in valid})
+    atomic_write(cfg.spool_file(name), lines)
+    info(f"{name}: stored {len(lines)} entries")
+    return 0
+
+
+def subtract(net, protected):
+    """Return net minus every protected network that overlaps it."""
+    parts = [net]
+    for p in protected:
+        if p.version != net.version:
+            continue
+        nxt = []
+        for part in parts:
+            if not part.overlaps(p):
+                nxt.append(part)
+            elif part.prefixlen < p.prefixlen:   # part contains p: split around it
+                nxt.extend(part.address_exclude(p))
+            # else: part lies inside p and is dropped
+        parts = nxt
+    return parts
+
+
+def remove_covered(nets):
+    """Drop entries contained in another entry. Adjacent networks are not
+    merged, so the list does not gain ranges (ranges are slow in iptables)."""
+    netset = set(nets)
+    result = []
+    for n in nets:
+        if not any(n.supernet(new_prefix=p) in netset for p in range(n.prefixlen)):
+            result.append(n)
+    return result
+
+
+def cmd_assemble(cfg, force):
+    lock = open(os.path.join(cfg.spool_dir, ".assemble.lock"), "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    # A download finishing while we run triggers update-blocklist.service again,
+    # but systemd merges that into the running job. So repeat until no source
+    # changed during the run.
+    for _ in range(5):
+        started = time.time()
+        rc = assemble_once(cfg, force)
+        if rc or not any(os.path.getmtime(cfg.spool_file(n)) >= started
+                         for n in cfg.sources() if os.path.exists(cfg.spool_file(n))):
+            return rc
+        info("a source was updated during assembly, assembling again")
+    return rc
+
+
+def assemble_once(cfg, force):
+    entries, now = set(), time.time()
+    for name in cfg.sources():
+        path = cfg.spool_file(name)
+        if not os.path.exists(path):
+            continue
+        max_age = cfg.cp[name].getfloat("max_age_days", cfg.default_max_age)
+        age_days = (now - os.path.getmtime(path)) / 86400
+        if age_days > max_age:
+            warn(f"{name}: list is {age_days:.1f} days old (max {max_age:g}), leaving it out")
+            continue
+        with open(path) as f:
+            nets = [n for n in (parse_network(l.strip()) for l in f if l.strip()) if n]
+        info(f"{name}: {len(nets)} entries, {age_days * 24:.1f} h old")
+        entries.update(nets)
+    for path in os.listdir(cfg.spool_dir):
+        if path.endswith(".txt") and path[:-4] not in cfg.sources():
+            warn(f"ignoring {os.path.join(cfg.spool_dir, path)}: no such source in {CONFIG_FILE}")
+
+    protected = SPECIAL_NETS + cfg.never_block
+    rejected_broad = rejected_special = 0
+    cleaned = set()
+    for net in entries:
+        if net.prefixlen < cfg.min_prefix[net.version] or (net.version == 6 and not net.subnet_of(GLOBAL_UNICAST_V6)):
+            rejected_broad += 1
+            continue
+        parts = subtract(net, protected)
+        if parts != [net]:
+            rejected_special += 1
+        cleaned.update(parts)
+    if rejected_broad:
+        warn(f"rejected {rejected_broad} entries broader than /{cfg.min_prefix[4]} (IPv4) or /{cfg.min_prefix[6]} (IPv6)")
+    if rejected_special:
+        warn(f"removed or split {rejected_special} entries overlapping private, reserved or never_block networks")
+
+    nets = sorted(remove_covered(sorted(cleaned, key=lambda n: n.prefixlen)),
+                  key=lambda n: (n.version, n.network_address, n.prefixlen))
+    lines = [fmt(n) for n in nets]
+
+    old = []
+    if os.path.exists(cfg.output):
+        with open(cfg.output) as f:
+            old = [l.strip() for l in f if l.strip()]
+    if lines == old:
+        info(f"published list unchanged ({len(lines)} entries)")
+        return 0
+    if old and len(lines) < len(old) * (100 - cfg.max_shrink) / 100 and not force:
+        error(f"new list has {len(lines)} entries, published one {len(old)}: shrinks by more than "
+              f"{cfg.max_shrink}%, not publishing. Check the sources, or run 'blocklist assemble --force'")
+        return 1
+
+    atomic_write(cfg.output, lines)
+    info(f"published {len(lines)} entries to {cfg.output} (was {len(old)})")
+    if cfg.post_publish:
+        r = subprocess.run(shlex.split(cfg.post_publish), capture_output=True, text=True)
+        out = (r.stdout + r.stderr).strip()
+        if r.returncode:
+            error(f"'{cfg.post_publish}' failed with exit code {r.returncode}: {out[:500]}")
+            return 1
+        # occ exits with 0 even when it fails; with --quiet any output is an error
+        if out:
+            error(f"'{cfg.post_publish}' printed: {out[:500]}")
+            return 1
+    return 0
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[0] == "fetch":
+        return cmd_fetch(Config(), argv[1])
+    if argv and argv[0] == "assemble":
+        return cmd_assemble(Config(), "--force" in argv[1:])
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[Unit]
+Description=Periodic download of IP blocklist %i
+
+[Timer]
+OnCalendar=*-*-* 00/6:20:00
+RandomizedDelaySec=20min
+Persistent=yes
+
+[Install]
+WantedBy=timers.target

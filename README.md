@@ -66,8 +66,25 @@ systemctl daemon-reload
 ```
 
 `make install` puts the script into `/usr/local/sbin`, the units into
-`/etc/systemd/system`, and the sample configuration into
-`/etc/blocklists/blocklists.conf`, unless that file already exists.
+`/etc/systemd/system`, the bash completion into
+`/usr/local/share/bash-completion/completions`, and the sample configuration
+into `/etc/blocklists/blocklists.conf`, unless that file already exists. The
+units get the script's path and `User=`/`Group=` from `SBINDIR` and
+`SPOOL_USER`/`SPOOL_GROUP`, e.g. on Debian:
+
+```sh
+make install PREFIX=/usr SPOOL_USER=www-data SPOOL_GROUP=www-data
+```
+
+`make install-files` installs everything but the spool directory and works
+without root, e.g. with `DESTDIR` for packaging.
+
+Packages for openSUSE, Debian and Ubuntu are built on the
+[openSUSE Build Service](https://build.opensuse.org/package/show/home:Aikhjarto/blocklist-updater).
+They install the script into `/usr/sbin` and the units into
+`/usr/lib/systemd/system`, create `/var/spool/blocklists` with
+systemd-tmpfiles, run the units as the web server user (`wwwrun`/`www` on
+openSUSE, `www-data` on Debian and Ubuntu), and enable nothing.
 
 Then:
 
@@ -103,6 +120,13 @@ drop it at once, delete `/var/spool/blocklists/<source>.txt` and assemble.
 
 The published list has one IPv4/IPv6 address or CIDR range per line and no
 comments. Single addresses are written without `/32` or `/128`.
+
+## Bash completion
+
+`completions/blocklist` completes the commands, `--force`, and for `fetch`
+the sources of the configuration file (`BLOCKLIST_CONFIG` or
+`/etc/blocklists/blocklists.conf`, if readable). `make install` and the
+packages install it.
 
 ## Adding a provider
 

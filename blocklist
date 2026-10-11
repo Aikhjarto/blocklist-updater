@@ -5,6 +5,8 @@
 
   blocklist fetch <source>     download one source into the spool directory
   blocklist assemble [--force] merge fresh sources and publish the list
+  blocklist -h|--help          show this help
+  blocklist -V|--version       show the version
 
 Configuration: /etc/blocklists/blocklists.conf, or the file named by the
 environment variable BLOCKLIST_CONFIG.
@@ -23,7 +25,8 @@ import time
 import urllib.request
 
 CONFIG_FILE = os.environ.get("BLOCKLIST_CONFIG", "/etc/blocklists/blocklists.conf")
-USER_AGENT = "blocklist-updater/1.0"
+VERSION = "0.1"
+USER_AGENT = f"blocklist-updater/{VERSION}"
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
 # networks that must never end up in a blocklist (RFC 6890 and friends)
@@ -295,6 +298,12 @@ def assemble_once(cfg, force):
 
 
 def main(argv):
+    if argv in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    if argv in (["-V"], ["--version"]):
+        print(f"blocklist {VERSION}")
+        return 0
     if len(argv) >= 2 and argv[0] == "fetch":
         return cmd_fetch(Config(), argv[1])
     if argv and argv[0] == "assemble":

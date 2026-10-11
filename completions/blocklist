@@ -1,0 +1,36 @@
+# bash completion for blocklist                              -*- shell-script -*-
+
+# the source names: the sections of the configuration file except [global]
+_blocklist_sources()
+{
+    local line config=${BLOCKLIST_CONFIG:-/etc/blocklists/blocklists.conf}
+    [[ -r $config ]] || return
+    while IFS= read -r line; do
+        line=${line%%$'\r'}
+        if [[ $line =~ ^\[([^]]+)\][[:space:]]*$ && ${BASH_REMATCH[1]} != global ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}"
+        fi
+    done < "$config"
+}
+
+_blocklist()
+{
+    local cur=${COMP_WORDS[COMP_CWORD]}
+    COMPREPLY=()
+
+    if ((COMP_CWORD == 1)); then
+        mapfile -t COMPREPLY < <(compgen -W 'fetch assemble -h --help -V --version' -- "$cur")
+        return
+    fi
+    case ${COMP_WORDS[1]} in
+        fetch)
+            if ((COMP_CWORD == 2)); then
+                mapfile -t COMPREPLY < <(compgen -W "$(_blocklist_sources)" -- "$cur")
+            fi
+            ;;
+        assemble)
+            mapfile -t COMPREPLY < <(compgen -W '--force' -- "$cur")
+            ;;
+    esac
+}
+complete -F _blocklist blocklist

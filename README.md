@@ -8,9 +8,9 @@ later, which blocks ranges via `hash:net` ipsets).
 
 ```
 update-blocklist@<source>.timer ─► blocklist fetch <source> ─► /var/spool/blocklists/<source>.txt
-                                         │ OnSuccess=
-                                         ▼
-update-blocklist.timer ───────────► blocklist assemble ─► output file ─► post_publish (occ files:scan)
+                                                                          │
+update-blocklist.timer (hourly, :50) ─► blocklist assemble ◄──────────────┘
+                                         └─► output file ─► post_publish (occ files:scan)
 ```
 
 ## Features
@@ -56,8 +56,7 @@ Check each provider's terms of use before redistributing its data.
 
 ## Installation
 
-Requirements: Python 3.9 or later (standard library only), systemd 249 or
-later (for `OnSuccess=`).
+Requirements: Python 3.9 or later (standard library only), systemd.
 
 ```sh
 make check                     # run the tests

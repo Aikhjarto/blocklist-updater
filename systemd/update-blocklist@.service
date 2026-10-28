@@ -4,8 +4,9 @@ Description=Download IP blocklist %i
 Documentation=file:/etc/blocklists/blocklists.conf
 Wants=network-online.target
 After=network-online.target
-# rebuild the published list after every successful download
-OnSuccess=update-blocklist.service
+# update-blocklist.timer assembles the downloaded lists every hour. No
+# OnSuccess= here: when two downloads finish together, systemd logs
+# "multiple trigger source candidates for exit status propagation".
 
 [Service]
 Type=oneshot

@@ -25,7 +25,7 @@ import time
 import urllib.request
 
 CONFIG_FILE = os.environ.get("BLOCKLIST_CONFIG", "/etc/blocklists/blocklists.conf")
-VERSION = "0.1"
+VERSION = "0.2"
 USER_AGENT = f"blocklist-updater/{VERSION}"
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
@@ -218,9 +218,8 @@ def remove_covered(nets):
 def cmd_assemble(cfg, force):
     lock = open(os.path.join(cfg.spool_dir, ".assemble.lock"), "w")
     fcntl.flock(lock, fcntl.LOCK_EX)
-    # A download finishing while we run triggers update-blocklist.service again,
-    # but systemd merges that into the running job. So repeat until no source
-    # changed during the run.
+    # A download may finish while we run, and the next assembly would only pick
+    # it up an hour later. So repeat until no source changed during the run.
     for _ in range(5):
         started = time.time()
         rc = assemble_once(cfg, force)
